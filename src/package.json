@@ -1,0 +1,14 @@
+{
+    "name": "lambda-hackathon",
+    "version": "1.0.0",
+    "description": "Project setup for using Slack API",
+    "main": "index.js",
+    "scripts": {
+        "start": "node index.js"
+    },
+    "dependencies": {
+        "@aws-sdk/client-ses": "^3.830.0",
+        "pdfkit": "^0.17.1",
+        "uuid": "^11.1.0"
+    }
+}
