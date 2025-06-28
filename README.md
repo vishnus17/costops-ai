@@ -32,6 +32,17 @@ This project is a modern, serverless AWS solution for automated cost and inciden
 - **Bedrock AI**
   - Summarizes cost and incident data with strict prompt engineering.
 
+### Architecture Diagram
+
+<details>
+  <summary>Click to expand the architecture diagram (draw.io export)</summary>
+
+  <iframe src="costops.drawio.html" width="100%" height="600" frameborder="0" title="Architecture Diagram"></iframe>
+
+  <br/>
+  <em>If the diagram does not render, open <a href="costops.drawio.html">costops.drawio.html</a> directly in your browser.</em>
+</details>
+
 ## Project Structure
 ```
 lib/lambda-hackathon-stack.ts   # CDK stack (infrastructure as code)
