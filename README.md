@@ -34,14 +34,9 @@ This project is a modern, serverless AWS solution for automated cost and inciden
 
 ### Architecture Diagram
 
-<details>
-  <summary>Click to expand the architecture diagram (draw.io export)</summary>
-
-  <iframe src="costops.drawio.html" width="100%" height="600" frameborder="0" title="Architecture Diagram"></iframe>
-
-  <br/>
-  <em>If the diagram does not render, open <a href="costops.drawio.html">costops.drawio.html</a> directly in your browser.</em>
-</details>
+<p align="center">
+  <img src="img/costops.svg" alt="Architecture Diagram" width="80%"/>
+</p>
 
 ## Project Structure
 ```
