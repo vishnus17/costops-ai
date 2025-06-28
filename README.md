@@ -35,7 +35,7 @@ This project is a modern, serverless AWS solution for automated cost and inciden
 ### Architecture Diagram
 
 <p align="center">
-  <img src="img/costops.svg" alt="Architecture Diagram" width="80%"/>
+  <img src="img/costops.svg" alt="Architecture Diagram" width="100%"/>
 </p>
 
 ## Project Structure
