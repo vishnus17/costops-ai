@@ -107,44 +107,46 @@ export async function generateCostReportPDF(responseText, data) {
             angle += sliceAngle;
         });
 
-        const legendX = centerX + radius + 40;
-        let legendY = centerY - radius;
-        doc.font('Helvetica-Bold').fontSize(12).fillColor('#222').text('Service Breakdown', legendX, legendY, { continued: false });
-        legendY += 28; // Increased spacing after title
-        const legendBoxSize = 14; // Slightly larger color box
-        const legendTextOffset = 22; // More space between box and text
-        const legendMaxWidth = doc.page.width - legendX - 20; // Prevent overflow
+        // --- Legend below the pie chart, side by side ---
+        const legendStartY = centerY + radius + 40;
+        let legendX = doc.page.margins.left;
+        let legendY = legendStartY;
+        const legendBoxSize = 14;
+        const legendTextOffset = 8;
         const legendFont = 'Helvetica';
         const legendFontSize = 10;
+        const legendEntrySpacingX = 24; // Space between legend entries horizontally
+        const legendEntrySpacingY = 12; // Space between legend rows vertically
+        const legendMaxWidth = doc.page.width - doc.page.margins.right;
         doc.font(legendFont).fontSize(legendFontSize);
-        const legendEntrySpacing = 6; // Minimum spacing between entries
+        // Title for legend
+        doc.font('Helvetica-Bold').fontSize(12).fillColor('#222').text('Service Breakdown', legendX, legendY, { continued: false });
+        legendY += 22;
+        let rowHeight = 0;
         serviceCosts.slice(0, 30).forEach((s, i) => {
-            // Prepare legend text
             const percent = ((s.cost / total) * 100).toFixed(1);
             const legendText = `${s.service}: $${s.cost.toFixed(2)} (${percent}%)`;
-            // Calculate height needed for this legend entry
-            const textHeight = doc.heightOfString(legendText, {
-                width: legendMaxWidth - legendTextOffset,
-                align: 'left',
-            });
-            const entryHeight = Math.max(legendBoxSize, textHeight) + legendEntrySpacing;
-            // If legend would overflow page, add a new page and reset legendY
-            if (legendY + entryHeight > doc.page.height - doc.page.margins.bottom) {
-                doc.addPage();
-                legendY = doc.page.margins.top;
+            const textWidth = doc.widthOfString(legendText, { font: legendFont, size: legendFontSize });
+            const entryWidth = legendBoxSize + legendTextOffset + textWidth + legendEntrySpacingX;
+            rowHeight = Math.max(rowHeight, legendBoxSize);
+            // If next entry would overflow page width, wrap to next line
+            if (legendX + entryWidth > legendMaxWidth) {
+                legendX = doc.page.margins.left;
+                legendY += rowHeight + legendEntrySpacingY;
+                rowHeight = legendBoxSize;
             }
             // Draw color box
             doc.rect(legendX, legendY, legendBoxSize, legendBoxSize).fill(colors[i % colors.length]).stroke();
-            // Draw legend text (auto-wraps if too long)
+            // Draw legend text
             doc.font(legendFont).fontSize(legendFontSize).fillColor('#222').text(
                 legendText,
-                legendX + legendTextOffset,
-                legendY + 2,
-                { width: legendMaxWidth - legendTextOffset, continued: false, ellipsis: true }
+                legendX + legendBoxSize + legendTextOffset,
+                legendY + 1,
+                { continued: false }
             );
-            legendY += entryHeight;
+            legendX += entryWidth;
         });
-        doc.moveDown(8);
+        doc.moveDown(4);
     }
 
     doc.end();

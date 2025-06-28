@@ -4,21 +4,24 @@ import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost
 import { SSMIncidentsClient, ListIncidentRecordsCommand } from "@aws-sdk/client-ssm-incidents";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutRuleCommand, PutTargetsCommand } from "@aws-sdk/client-eventbridge";
-import { askBedrock, buildCostSummaryPrompt, buildUserRequestPrompt } from "./bedrock-utils.mjs";
-import { generateCostReportPDF } from "./pdf-utils.mjs";
-import { DynamoDBClient, PutItemCommand, GetItemCommand, UpdateItemCommand } from "@aws-sdk/client-dynamodb";
+import { askBedrock, buildCostSummaryPrompt, buildUserRequestPrompt } from "../utils/bedrock-utils.mjs";
+import { generateCostReportPDF } from "../utils/pdf-utils.mjs";
+import { DDBUtils } from "../utils/dynamodb-utils.mjs";
 import { v4 as uuidv4 } from "uuid";
 
 const region = 'ap-south-1';
 const s3 = new S3Client({region});
-const dynamo = new DynamoDBClient({region});
+const ddbUtils = new DDBUtils({
+    region,
+    reportsTable: process.env.REPORTS_DDB_TABLE,
+    cacheTable: process.env.COST_EXPLORER_CACHE_TABLE || 'CostExplorerCache'
+});
 const S3_BUCKET = process.env.REPORTS_BUCKET || "lambda-cost-reports";
-const DDB_TABLE = process.env.REPORTS_DDB_TABLE || "CostReportRequests";
 const CF_URL = process.env.CF_URL;
 
 
 // Helper to create a recurring EventBridge rule for scheduled cost reports
-async function createRecurringCostReportRule({ days, cronExpression }) {
+async function createRecurringCostReportRule({ query, cronExpression }) {
     const eventBridge = new EventBridgeClient();
     const ruleName = `ScheduledCostReport-${Date.now()}`;
     await eventBridge.send(new PutRuleCommand({
@@ -30,55 +33,73 @@ async function createRecurringCostReportRule({ days, cronExpression }) {
     await eventBridge.send(new PutTargetsCommand({
         Rule: ruleName,
         Targets: [
-            {
-                Id: `ScheduledCostReportTarget-${userId}`,
+            {   
+                Id: `ScheduledCostReportTarget-${Date.now()}`,
                 Arn: process.env.SCHEDULED_COST_REPORT_LAMBDA_ARN,
-                Input: JSON.stringify({ days })
+                Input: JSON.stringify({ query })
             }
         ]
     }));
 }
 
 async function saveReportToDynamo({ requestId, userCommand, parsedJsonQuery, reportUrl, costSummaryText, email }) {
-    await dynamo.send(new PutItemCommand({
-        TableName: DDB_TABLE,
-        Item: {
-            requestId: { S: requestId },
-            userCommand: { S: userCommand },
-            parsedJsonQuery: { S: JSON.stringify(parsedJsonQuery) },
-            reportUrl: { S: reportUrl },
-            costSummaryText: { S: costSummaryText },
-            createdAt: { S: new Date().toISOString() },
-            ...(email ? { email: { S: email } } : {})
-        }
-    }));
+    return ddbUtils.saveReport({ requestId, userCommand, parsedJsonQuery, reportUrl, costSummaryText, email });
 }
 
 async function getReportFromDynamo(requestId) {
-    const res = await dynamo.send(new GetItemCommand({
-        TableName: DDB_TABLE,
-        Key: { requestId: { S: requestId } }
-    }));
-    return res.Item;
+    return ddbUtils.getReport(requestId);
 }
 
 async function updateEmailInDynamo(requestId, email) {
-    await dynamo.send(new UpdateItemCommand({
-        TableName: DDB_TABLE,
-        Key: { requestId: { S: requestId } },
-        UpdateExpression: "SET email = :e",
-        ExpressionAttributeValues: { ":e": { S: email } }
-    }));
+    return ddbUtils.updateEmail(requestId, email);
 }
 
 async function costReportHandler(parsedQuery, userEmail = null, requestId = null, userCommand = "") {
     const intent = (parsedQuery.intent || "").toLowerCase();
-    let isResourceLevel = intent.includes("highest cost") || intent.includes("most expensive resource");
+    let isResourceLevel = intent.includes("resource level breakdown");
     requestId = requestId || uuidv4();
 
+    // For resource-level breakdown, check cache first
     if (isResourceLevel) {
-        // Resource-level cost breakdowns are now handled asynchronously
-        // Save the request to DynamoDB for background processing and return
+        // Build cache key for resource-level breakdown
+        let groupBy = [{ Type: "DIMENSION", Key: "RESOURCE_ID" }];
+        let granularity = "DAILY";
+        let start, end;
+        if (parsedQuery.startDate && parsedQuery.endDate) {
+            start = new Date(parsedQuery.startDate);
+            end = new Date(parsedQuery.endDate);
+        } else if (parsedQuery.days) {
+            const days = parsedQuery.days;
+            end = new Date();
+            start = new Date();
+            start.setDate(end.getDate() - days);
+        } else {
+            end = new Date();
+            start = new Date();
+            start.setDate(end.getDate() - 14);
+        }
+        const cacheKeyObj = {
+            start: start.toISOString().split("T")[0],
+            end: end.toISOString().split("T")[0],
+            groupBy,
+            granularity
+        };
+        const cacheKey = Buffer.from(JSON.stringify(cacheKeyObj)).toString('base64');
+        const cacheResult = await ddbUtils.getCache({ cacheKey });
+        if (cacheResult.hit && cacheResult.reportUrl) {
+            return {
+                statusCode: 200,
+                headers: {
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "OPTIONS,POST"
+                },
+                body: JSON.stringify({
+                    message: `Resource-level Cost Report (cached) ✅. You can view the report here: ${cacheResult.reportUrl}`,
+                    requestId
+                })
+            };
+        }
+        // If not cached, proceed as before
         await saveReportToDynamo({
             requestId,
             userCommand,
@@ -137,25 +158,62 @@ async function costReportHandler(parsedQuery, userEmail = null, requestId = null
         start.setDate(end.getDate() - days);
     }
 
-    const params = {
-        TimePeriod: {
-            Start: start.toISOString().split("T")[0],
-            End: end.toISOString().split("T")[0],
-        },
-        Granularity: granularity,
-        Metrics: ["UnblendedCost"],
-        GroupBy: groupBy,
-        Filter: {
-            Not: {
-                Dimensions: {
-                    Key: "RECORD_TYPE",
-                    Values: ["Credit", "Refund"]
-                }
-            }
-        }
+    // --- DynamoDB-based caching for Cost Explorer API ---
+    const cacheKeyObj = {
+        start: start.toISOString().split("T")[0],
+        end: end.toISOString().split("T")[0],
+        groupBy,
+        granularity
     };
-
-    const data = await ceClient.send(new GetCostAndUsageCommand(params));
+    const cacheKey = Buffer.from(JSON.stringify(cacheKeyObj)).toString('base64');
+    let data;
+    let cacheHit = false;
+    // Use DDBUtils for cache
+    const cacheResult = await ddbUtils.getCache({ cacheKey });
+    if (cacheResult.hit) {
+        data = cacheResult.data;
+        if (cacheResult.reportUrl) {
+            const cachedReportUrl = cacheResult.reportUrl;
+            console.log("Using cached report URL:", cachedReportUrl);
+            return { 
+                statusCode: 200,
+                headers: {
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "OPTIONS,POST"
+                },
+                body: JSON.stringify({
+                    message: `Cost Report (cached) ✅. You can view the report here: ${cachedReportUrl}`,
+                    requestId
+                })
+            };
+        }
+        cacheHit = true;
+    }
+    if (!cacheHit) {
+        try {
+            data = await ceClient.send(new GetCostAndUsageCommand({
+                TimePeriod: {
+                    Start: start.toISOString().split("T")[0],
+                    End: end.toISOString().split("T")[0],
+                },
+                Granularity: granularity,
+                Metrics: ["UnblendedCost"],
+                GroupBy: groupBy,
+                Filter: {
+                    Not: {
+                        Dimensions: {
+                            Key: "RECORD_TYPE",
+                            Values: ["Credit", "Refund"]
+                        }
+                    }
+                }
+            }));
+            console.log(JSON.stringify({ level: 'info', msg: 'Fetched Cost Explorer result', cacheKey }));
+        } catch (err) {
+            console.error(JSON.stringify({ level: 'error', msg: 'Cost Explorer fetch/cache failed', cacheKey, error: err.message }));
+            throw err;
+        }
+    }
 
     // Prepare Bedrock prompt based on intent
     const summaryPrompt = buildCostSummaryPrompt(data, intent, granularity, groupBy);
@@ -187,6 +245,9 @@ async function costReportHandler(parsedQuery, userEmail = null, requestId = null
 
     const reportUrl = `${CF_URL}/${pdfKey}`;
     console.log("Cost report generated:", reportUrl);
+
+    // Now update the DynamoDB cache with the report URL
+    await ddbUtils.setCache({ cacheKey, data, reportUrl });
 
     return { 
         statusCode: 200,
@@ -236,7 +297,7 @@ async function incidentStatusHandler(parsedQuery) {
         return {
             statusCode: 200,
             headers: {
-                "Access-Control-Allow-Origin": "*", // or your domain
+                "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "OPTIONS,POST"
             },
             body: JSON.stringify({
@@ -248,7 +309,7 @@ async function incidentStatusHandler(parsedQuery) {
         return {
             statusCode: 500,
             headers: {
-                "Access-Control-Allow-Origin": "*", // or your domain
+                "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "OPTIONS,POST"
             },
             body: JSON.stringify({
@@ -258,6 +319,11 @@ async function incidentStatusHandler(parsedQuery) {
     }
 }
 
+// Input validation helper
+function validateEmail(email) {
+    return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email);
+}
+
 // Main handler that dynamically invokes the necessary function
 export const mainHandler = async (event) => {
     try {
@@ -265,6 +331,14 @@ export const mainHandler = async (event) => {
         const userCommand = body.message;
         const userEmail = body.email || null;
         const requestId = body.requestId || null;
+
+        // Input validation
+        if (userEmail && !validateEmail(userEmail)) {
+            return {
+                statusCode: 400,
+                body: JSON.stringify({ message: '❌ Invalid email address.' })
+            };
+        }
 
         // Build the user request prompt for Bedrock
         const bedrockPrompt = buildUserRequestPrompt(userCommand);
@@ -284,10 +358,10 @@ export const mainHandler = async (event) => {
         console.log("Parsed JSON query:", parsedJsonQuery);
         const intent = (parsedJsonQuery.intent || "").toLowerCase();
         
-        if (intent.includes("schedule")) {
+        if (intent.includes("scheduled cost report")) {
             await createRecurringCostReportRule({
-                days: parsedJsonQuery.days || 7,
-                cronExpression: parsedJsonQuery.cronExpression || 'cron(0 8 * * ? *)'
+                query: parsedJsonQuery,
+                cronExpression: parsedJsonQuery.cronExpression,
             });
             return { 
                 statusCode: 200,
@@ -296,12 +370,12 @@ export const mainHandler = async (event) => {
                     "Access-Control-Allow-Methods": "OPTIONS,POST"
                 }, 
                 body: JSON.stringify({
-                    message: `✅ Scheduled cost report successfully. It will run according to the specified cron expression: ${parsedQuery.cronExpression || 'cron(0 8 * * ? *)'}.`
+                    message: `✅ Scheduled cost report successfully. It will run according to the specified cron expression: ${parsedJsonQuery.cronExpression}.`
                 }),
             };
-        } else if (intent.includes("cost")) {
+        } else if (intent.includes("resource level breakdown") || intent.includes("monthly billing") || intent.includes("daily billing")) {
             return await costReportHandler(parsedJsonQuery, userEmail, requestId, userCommand);
-        } else if (intent.includes("incident")) {
+        } else if (intent.includes("anomaly report")) {
             return await incidentStatusHandler(parsedJsonQuery);
         } else {
             return {
@@ -316,7 +390,7 @@ export const mainHandler = async (event) => {
             };
         }
     } catch (error) {
-        console.error("mainHandler error:", error);
+        console.error(JSON.stringify({ level: 'error', msg: 'mainHandler error', error: error.message }));
         return {
             statusCode: 400,
             body: JSON.stringify({

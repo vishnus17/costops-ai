@@ -1,17 +1,21 @@
-import { DynamoDBClient, UpdateItemCommand } from "@aws-sdk/client-dynamodb";
 import { CostExplorerClient, GetCostAndUsageWithResourcesCommand } from "@aws-sdk/client-cost-explorer";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
-import { generateCostReportPDF } from "./pdf-utils.mjs";
-import { askBedrock, buildCostSummaryPrompt } from "./bedrock-utils.mjs";
+import { generateCostReportPDF } from "../utils/pdf-utils.mjs";
+import { askBedrock, buildCostSummaryPrompt } from "../utils/bedrock-utils.mjs";
+import { DDBUtils } from "../utils/dynamodb-utils.mjs";
 
 const region = 'ap-south-1';
+const ddbUtils = new DDBUtils({
+    region,
+    reportsTable: process.env.REPORTS_DDB_TABLE,
+    cacheTable: process.env.COST_EXPLORER_CACHE_TABLE || 'CostExplorerCache'
+});
 
-const dynamo = new DynamoDBClient({region});
 const s3 = new S3Client({region});
 const ses = new SESClient({region});
+const ceClient = new CostExplorerClient({ region });
 
-const DDB_TABLE = process.env.REPORTS_DDB_TABLE;
 const S3_BUCKET = process.env.REPORTS_BUCKET;
 const CF_URL = process.env.CF_URL;
 
@@ -45,11 +49,20 @@ export const handler = async (event) => {
         if (parsedQuery.startDate && parsedQuery.endDate) {
             start = new Date(parsedQuery.startDate);
             end = new Date(parsedQuery.endDate);
+        } else if (parsedQuery.days) {
+            const days = parsedQuery.days;
+            end = new Date();
+            start = new Date();
+            start.setDate(end.getDate() - days);
         } else {
             end = new Date();
             start = new Date();
             start.setDate(end.getDate() - 14);
         }
+        
+        console.log(`Using start date: ${start.toISOString()}, end date: ${end.toISOString()}`);
+        
+        // Cost Explorer parameters
         const params = {
             TimePeriod: {
                 Start: start.toISOString().split("T")[0],
@@ -67,23 +80,61 @@ export const handler = async (event) => {
                 }
             }
         };
-        const ceClient = new CostExplorerClient({ region });
+        
+        // --- DynamoDB-based caching for Cost Explorer API ---
+        const cacheKeyObj = {
+            start: start.toISOString().split("T")[0],
+            end: end.toISOString().split("T")[0],
+            groupBy,
+            granularity
+        };
+        const cacheKey = Buffer.from(JSON.stringify(cacheKeyObj)).toString('base64');
         let data;
-        try {
-            data = await ceClient.send(new GetCostAndUsageWithResourcesCommand(params));
-        } catch (err) {
-            await dynamo.send(new UpdateItemCommand({
-                TableName: DDB_TABLE,
-                Key: { requestId: { S: requestId } },
-                UpdateExpression: "SET reportUrl = :u, costSummaryText = :t",
-                ExpressionAttributeValues: {
-                    ":u": { S: "ERROR" },
-                    ":t": { S: `Failed to generate report: ${err.message}` }
-                }
-            }));
+        let cachedReportUrl = null;
+        // Use DDBUtils for cache
+        const cacheResult = await ddbUtils.getCache({ cacheKey });
+        if (cacheResult.hit) {
+            data = cacheResult.data;
+            cachedReportUrl = cacheResult.reportUrl;
+        }
+        // If cache miss, call Cost Explorer API
+        if (!cacheResult.hit) {
+            try {
+                data = await ceClient.send(new GetCostAndUsageWithResourcesCommand(params));
+                // Do NOT write to cache yet; wait until report is generated for atomic write
+            } catch (err) {
+                await ddbUtils.updateReportStatus(requestId, {
+                    reportUrl: "ERROR",
+                    costSummaryText: `Failed to generate report: ${err.message}`
+                });
+                continue;
+            }
+        }
+        // If cache hit and reportUrl exists, skip report generation and just update DDB and notify
+        if (cacheResult.hit && cachedReportUrl) {
+            await ddbUtils.updateReportStatus(requestId, {
+                reportUrl: cachedReportUrl,
+                costSummaryText: "Report generated from cache."
+            });
+            // Send email notification here as well if needed
+            const emailParams = {
+                Destination: { ToAddresses: [email] },
+                Message: {
+                    Body: { Text: { Data: `Your AWS Resource-level Cost Report is ready.\n\nYou can download the PDF report here: ${cachedReportUrl}` } },
+                    Subject: { Data: "Your AWS Resource-level Cost Report" },
+                },
+                Source: "cost-reports@learnmorecloud.com"
+            };
+            try {
+                await ses.send(new SendEmailCommand(emailParams));
+            } catch (err) {
+                console.error(`Failed to send email for request ${requestId}:`, err);
+            }
             continue;
         }
-        // Summarize and generate PDF
+        // If cache miss, proceed with report generation
+        console.log(`Generating report for request ${requestId}`);
+
         const summaryPrompt = buildCostSummaryPrompt(data, granularity, groupBy);
         const bedrockCostResponse = await askBedrock(summaryPrompt);
         const costSummaryText = bedrockCostResponse.trim();
@@ -96,6 +147,8 @@ export const handler = async (event) => {
             ContentType: "application/pdf",
         }));
         const finalReportUrl = `${CF_URL}/${pdfKey}`;
+        // Use DDBUtils for atomic cache write
+        await ddbUtils.setCache({ cacheKey, data, reportUrl: finalReportUrl });
 
         console.log(`Generated report for request ${requestId}: ${finalReportUrl}`);
         // Send email
@@ -108,21 +161,15 @@ export const handler = async (event) => {
             Source: "cost-reports@learnmorecloud.com"
         };
         try {
-            const sesResponse = await ses.send(new SendEmailCommand(emailParams));
-            console.log(`Email logs: ${sesResponse}`);
+            await ses.send(new SendEmailCommand(emailParams));
         } catch (err) {
             console.error(`Failed to send email for request ${requestId}:`, err);
         }
-        // Update DynamoDB with report URL and summary
-        await dynamo.send(new UpdateItemCommand({
-            TableName: DDB_TABLE,
-            Key: { requestId: { S: requestId } },
-            UpdateExpression: "SET reportUrl = :u, costSummaryText = :t",
-            ExpressionAttributeValues: {
-                ":u": { S: finalReportUrl },
-                ":t": { S: costSummaryText }
-            }
-        }));
+        // Use DDBUtils to update report status
+        await ddbUtils.updateReportStatus(requestId, {
+            reportUrl: finalReportUrl,
+            costSummaryText
+        });
     }
     return { statusCode: 200 };
 };
