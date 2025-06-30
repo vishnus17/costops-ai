@@ -16,7 +16,7 @@ export async function askBedrock(prompt) {
         new InvokeModelCommand({
             contentType: "application/json",
             body: JSON.stringify(payload),
-            modelId: "amazon.nova-pro-v1:0",
+            modelId: "us.amazon.nova-premier-v1:0",
         })
     );
 
@@ -36,68 +36,130 @@ export async function askBedrock(prompt) {
     return parsed;
 }
 
-export function buildCostSummaryPrompt(data, granularity, groupBy) {
-    if (groupBy[0].Key === "RESOURCE_ID") {
-        return `
-        As a cloud cost analyst, review the following AWS Cost Explorer data (JSON) and generate a concise summary report for a PDF document in plain text.
-        - Focus on the resources with the highest cost in the specified time period.
-        - Use clear section headings (e.g., "AWS Resource Cost Report", "Top Resources by Spend", "Trends and Anomalies").
+export function buildCostSummaryPrompt(data, userCommand, granularity) {
+    const totalCost = data.ResultsByTime.reduce((sum, entry) => {
+        if (Array.isArray(entry.Groups)) {
+            return sum + entry.Groups.reduce((gSum, group) => {
+                const amount = group.Metrics?.UnblendedCost?.Amount;
+                return gSum + (amount ? parseFloat(amount) : 0);
+            }, 0);
+        }
+        return sum;
+    }, 0);
+
+    console.log("Total cost calculated:", totalCost);
+
+    const reportInstructions = `
+        As a cloud cost analyst, review the AWS Cost Explorer data and generate a summary:
+        - If the user is requesting something specific in the ${userCommand}, focus on that.
+        - Use clear section headings (e.g., "AWS Resource Cost Report", "Top Resources by Spend", "Trends and Anomalies" and "Summary").
         - Use bullet points for notable trends or anomalies.
         - Do NOT use markdown, emojis, or any special formatting.
         - Keep the report clear and professional, using ONLY plain text.
-        - At the end, provide a summary line with the resource with the highest cost and the total spend.
-        - IMPORTANT: Calculate and include the total cost sum from the provided data. Do NOT estimate or guess. Only use the numbers in the data.
+        - Include calculated total cost: \$\ ${totalCost.toFixed(2)}.
+    `;
 
-        Cost Explorer Data:
-        ${JSON.stringify(data.ResultsByTime, null, 2)}
+    if (granularity === "DAILY") {
+        return `
+        Analyze AWS costs by Top Resources.
+        ${reportInstructions}
+        Data:
+        \ ${JSON.stringify(data.ResultsByTime, null, 2)}
         `;
-    } else if (granularity === "MONTHLY") {
+    } 
+    else if (granularity === "MONTHLY") {
         return `
-        As a cloud cost analyst, review the following AWS Cost Explorer data (JSON) and generate a concise monthly summary report for a PDF document in plain text.
-        - Use clear section headings (e.g., "AWS Monthly Cost Report", "Total Monthly Spend", "Service Breakdown", "Trends and Anomalies").
-        - Use bullet points for notable trends or anomalies.
-        - Do NOT use markdown, emojis, or any special formatting.
-        - Keep the report clear and professional, using ONLY plain text.
-        - At the end, provide a summary line with the total monthly spend and the time period covered.
-        - IMPORTANT: Calculate and include the total cost sum from the provided data. Do NOT estimate or guess. Only use the numbers in the data.
-
-        Cost Explorer Data:
-        ${JSON.stringify(data.ResultsByTime, null, 2)}
+        Analyze the monthly AWS costs.
+        - ${reportInstructions}
+        Data:
+        \ ${JSON.stringify(data.ResultsByTime, null, 2)}
         `;
-    } else {
+    } 
+    else {
         return `
-        As a cloud cost analyst, review the following AWS Cost Explorer data (JSON) and generate a concise summary report for a PDF document in plain text.
-        - Use clear section headings (e.g., "AWS Cost Report", "Total Spend", "Service Breakdown", "Trends and Anomalies").
-        - Use bullet points for notable trends or anomalies.
-        - Do NOT use markdown, emojis, or any special formatting.
-        - Keep the report clear and professional, using ONLY plain text.
-        - At the end, provide a summary line with the total spend and the time period covered.
-        - IMPORTANT: Calculate and include the total cost sum from the provided data. Do NOT estimate or guess. Only use the numbers in the data.
-
-        Cost Explorer Data:
-        ${JSON.stringify(data.ResultsByTime, null, 2)}
+        Summarize AWS costs as per user request.
+        - ${reportInstructions}
+        Data:
+        \ ${JSON.stringify(data.ResultsByTime, null, 2)}
         `;
     }
 }
 
+/**
+ * Builds a summary prompt for Bedrock for month-to-month cost comparison.
+ * @param {object} period1 - { start: string, end: string }
+ * @param {object} period2 - { start: string, end: string }
+ * @param {object} comparisonData - The AWS Cost Explorer comparison data.
+ * @returns {string} The prompt string for Bedrock.
+ */
+export function buildMonthComparisonSummaryPrompt(period1, period2, comparisonData) {
+    // Extract total costs
+    const totalCosts = comparisonData.TotalCostAndUsage?.UnblendedCost || {};
+    const baselineTotal = parseFloat(totalCosts.BaselineTimePeriodAmount || '0');
+    const comparisonTotal = parseFloat(totalCosts.ComparisonTimePeriodAmount || '0');
+    const totalDifference = parseFloat(totalCosts.Difference || '0');
+    
+    // Extract service-level data
+    const serviceComparisons = comparisonData.CostAndUsageComparisons || [];
+    const significantChanges = serviceComparisons
+        .filter(service => {
+            const diff = parseFloat(service.Metrics?.UnblendedCost?.Difference || '0');
+            return Math.abs(diff) > 0.01; // Only show changes > $0.01
+        })
+        .sort((a, b) => {
+            const diffA = Math.abs(parseFloat(a.Metrics?.UnblendedCost?.Difference || '0'));
+            const diffB = Math.abs(parseFloat(b.Metrics?.UnblendedCost?.Difference || '0'));
+            return diffB - diffA; // Sort by largest absolute difference first
+        });
 
-// Bedrock function to parse user input into text
+    let serviceBreakdown = '';
+    significantChanges.slice(0, 10).forEach(service => {
+        const serviceName = service.CostAndUsageSelector?.Dimensions?.Values?.[0] || 'Unknown Service';
+        const baseline = parseFloat(service.Metrics?.UnblendedCost?.BaselineTimePeriodAmount || '0');
+        const comparison = parseFloat(service.Metrics?.UnblendedCost?.ComparisonTimePeriodAmount || '0');
+        const difference = parseFloat(service.Metrics?.UnblendedCost?.Difference || '0');
+        const percentChange = baseline > 0 ? ((difference / baseline) * 100).toFixed(1) : 'N/A';
+        
+        serviceBreakdown += `- ${serviceName}: Baseline $${baseline.toFixed(2)}, Comparison $${comparison.toFixed(2)}, Difference ${difference >= 0 ? '+' : ''}$${difference.toFixed(2)} (${percentChange}% change)\n`;
+    });
+
+    return `As a cloud cost analyst, compare AWS costs between these two periods:
+        Baseline Period: ${period2.start} to ${period2.end}
+        Comparison Period: ${period1.start} to ${period1.end}
+
+        TOTAL COST SUMMARY:
+        - Baseline Period Total: $${baselineTotal.toFixed(2)}
+        - Comparison Period Total: $${comparisonTotal.toFixed(2)}
+        - Total Difference: ${totalDifference >= 0 ? '+' : ''}$${totalDifference.toFixed(2)}
+        - Overall Change: ${baselineTotal > 0 ? ((totalDifference / baselineTotal) * 100).toFixed(1) : 'N/A'}%
+
+        TOP SERVICE CHANGES:
+        ${serviceBreakdown}
+
+        Generate a professional analysis with these sections:
+        - Use clear section headings (e.g., "Month-to-Month Cost Comparison", "Key Service Changes", "Cost Trends Analysis", "Summary and Recommendations")
+        - Focus on the most significant cost changes and their business impact
+        - Identify services with largest increases/decreases
+        - Use bullet points for key findings
+        - Do NOT use markdown, emojis, or any special formatting
+        - Keep the report clear and professional, using ONLY plain text
+        - Provide actionable insights based on the cost trends`;
+}
+
+// User input parser
 export function buildUserRequestPrompt(userCommand) {
     const today = new Date();
     const todayStr = today.toISOString().split('T')[0];
-    return `You are a Cloud Engineer. Parse this user input into a JSON request with the following fields: 'intent', 'days', 'includeAnomalies', 'startDate', 'endDate', and 'cronExpression'.
-            - Always use the current date (today: ${todayStr}) as the reference for any relative time phrases (e.g., 'last 7 days', 'this month', 'yesterday').
-            - Classify the 'intent' as one of ONLY the following: "monthly billing", "daily billing", "resource level breakdown", "anomaly report", or "scheduled cost report".
-            - If the user asks for a monthly cost statement (e.g., "monthly cost", "this month"), set 'intent' to "monthly billing", and set 'startDate' and 'endDate' to the first and last day of the current month in ISO 8601 format (YYYY-MM-DD). Set 'days' to null.
-            - If the user asks for a daily cost statement (e.g., "daily cost", "today", "yesterday"), set 'intent' to "daily billing", and set 'startDate' and 'endDate' to the relevant day(s) in ISO 8601 format (YYYY-MM-DD). Set 'days' to 1 if only one day is requested.
-            - If the user asks for a resource-level breakdown or the resource with the highest cost (e.g., "resource with highest cost", "most expensive resource", "resource breakdown"), set 'intent' to "resource level breakdown", set 'days' to 14, and leave 'startDate' and 'endDate' empty UNLESS a specific date range or number of days is mentioned.
-            - If the user asks for anomalies or incidents, set 'intent' to "anomaly report". This is for incident management.
-            - If the user asks to schedule or set up a recurring alert (e.g., "daily", "every Monday", "weekly", "biweekly", "every 1st of the month"), set 'intent' to "scheduled cost report". You MUST also set either 'days' or both 'startDate' and 'endDate' (ISO 8601 format) for the report period as per the user's request. If not specified, default to the last 7 days (days: 7). Generate a valid AWS EventBridge cron expression and set it as 'cronExpression'.
-            - The cron expression MUST be wrapped in cron(...), must have 6 fields (Minutes Hours Day-of-month Month Day-of-week Year), and must follow AWS EventBridge syntax. Do NOT use both '?' in Day-of-month and Day-of-week.
-            - Use this document for reference for AWS cron expressions: https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-scheduled-rule-pattern.html
-            - If the user specifies a custom time period (like a month, year, or date range), extract and set 'startDate' and 'endDate' in ISO 8601 format (YYYY-MM-DD).
-            - If not, use 'days' as a fallback.
-            - Respond ONLY with a valid JSON object and nothing else.
-            User: ${userCommand}
-            JSON:`;
+
+    return `Convert this command to JSON:
+    - 'intent': "monthly", "daily", "resource", "scheduled", or "compare-months"
+    - ONLY for intent: "compare-months", include 'period1' and 'period2' as objects with 'start' and 'end' (YYYY-MM-DD). Convert exactly like this: For example if user asks to compare June and May, period1 should be June 01 till July 01 and period2 should be May 01 till June 01.
+    - For other intents, include 'days', 'startDate', 'endDate' as normal and 'cronExpression' where needed. Refer this document for cron syntax: https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-scheduled-rule-pattern.html
+    - If intent is scheduled, specify the "granularity" (e.g., "DAILY" or "MONTHLY").
+    - If user has any special requirements, include them in 'specialRequirements'. For example, if users asks for top 5 costly service or resources.
+    - Time references use ${todayStr} as today.
+    - Cron format: cron(Minutes Hours Day-of-month Month Day-of-week Year).
+
+    Input: ${userCommand}
+    JSON:`;
 }

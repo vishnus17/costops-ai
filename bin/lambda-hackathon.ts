@@ -4,6 +4,7 @@ import { LambdaHackathonStack } from '../lib/lambda-hackathon-stack';
 
 const app = new cdk.App();
 new LambdaHackathonStack(app, 'LambdaHackathonStack', {
+  domainName: 'costops.learnmorecloud.com',
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION,

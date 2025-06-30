@@ -1,8 +1,8 @@
-import { CostExplorerClient, GetCostAndUsageWithResourcesCommand } from "@aws-sdk/client-cost-explorer";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { SESClient, SendEmailCommand } from "@aws-sdk/client-ses";
 import { generateCostReportPDF } from "../utils/pdf-utils.mjs";
 import { askBedrock, buildCostSummaryPrompt } from "../utils/bedrock-utils.mjs";
+import { getResourceLevelCosts } from "../utils/cost-explorer-utils.mjs";
 import { DDBUtils } from "../utils/dynamodb-utils.mjs";
 
 const region = 'ap-south-1';
@@ -14,14 +14,12 @@ const ddbUtils = new DDBUtils({
 
 const s3 = new S3Client({region});
 const ses = new SESClient({region});
-const ceClient = new CostExplorerClient({ region });
 
 const S3_BUCKET = process.env.REPORTS_BUCKET;
 const CF_URL = process.env.CF_URL;
 
 export const handler = async (event) => {
     for (const record of event.Records) {
-        console.log(`Processing record: ${JSON.stringify(record)}`);
         // Only process INSERT events
         if (record.eventName !== "INSERT") continue;
         const newImage = record.dynamodb.NewImage;
@@ -30,8 +28,9 @@ export const handler = async (event) => {
         const parsedJsonQueryStr = newImage.parsedJsonQuery?.S;
         const email = newImage.email?.S;
         const reportUrl = newImage.reportUrl?.S;
+        const userCommand = newImage.userCommand?.S;
         if (!requestId || !parsedJsonQueryStr || !email) continue;
-        if (reportUrl && reportUrl !== "PENDING") continue; // Already processed
+        if (reportUrl && reportUrl !== "PENDING") continue;
 
         let parsedQuery;
         try {
@@ -42,9 +41,7 @@ export const handler = async (event) => {
 
         console.log(`Parsed query for request ${requestId}:`, parsedQuery);
 
-        // Build Cost Explorer params from parsedQuery
-        let groupBy = [{ Type: "DIMENSION", Key: "RESOURCE_ID" }];
-        let granularity = "DAILY";
+        // Determine date range
         let end, start;
         if (parsedQuery.startDate && parsedQuery.endDate) {
             start = new Date(parsedQuery.startDate);
@@ -62,26 +59,10 @@ export const handler = async (event) => {
         
         console.log(`Using start date: ${start.toISOString()}, end date: ${end.toISOString()}`);
         
-        // Cost Explorer parameters
-        const params = {
-            TimePeriod: {
-                Start: start.toISOString().split("T")[0],
-                End: end.toISOString().split("T")[0],
-            },
-            Granularity: granularity,
-            Metrics: ["UnblendedCost"],
-            GroupBy: groupBy,
-            Filter: {
-                Not: {
-                    Dimensions: {
-                        Key: "RECORD_TYPE",
-                        Values: ["Credit", "Refund"]
-                    }
-                }
-            }
-        };
+        const granularity = "DAILY";
+        const groupBy = [{ Type: "DIMENSION", Key: "RESOURCE_ID" }];
         
-        // --- DynamoDB-based caching for Cost Explorer API ---
+        // Generate cache key for storing the result after report generation
         const cacheKeyObj = {
             start: start.toISOString().split("T")[0],
             end: end.toISOString().split("T")[0],
@@ -89,53 +70,28 @@ export const handler = async (event) => {
             granularity
         };
         const cacheKey = Buffer.from(JSON.stringify(cacheKeyObj)).toString('base64');
+        
         let data;
-        let cachedReportUrl = null;
-        // Use DDBUtils for cache
-        const cacheResult = await ddbUtils.getCache({ cacheKey });
-        if (cacheResult.hit) {
-            data = cacheResult.data;
-            cachedReportUrl = cacheResult.reportUrl;
-        }
-        // If cache miss, call Cost Explorer API
-        if (!cacheResult.hit) {
-            try {
-                data = await ceClient.send(new GetCostAndUsageWithResourcesCommand(params));
-                // Do NOT write to cache yet; wait until report is generated for atomic write
-            } catch (err) {
-                await ddbUtils.updateReportStatus(requestId, {
-                    reportUrl: "ERROR",
-                    costSummaryText: `Failed to generate report: ${err.message}`
-                });
-                continue;
-            }
-        }
-        // If cache hit and reportUrl exists, skip report generation and just update DDB and notify
-        if (cacheResult.hit && cachedReportUrl) {
-            await ddbUtils.updateReportStatus(requestId, {
-                reportUrl: cachedReportUrl,
-                costSummaryText: "Report generated from cache."
+        // Fetch cost data using utility function
+        try {
+            data = await getResourceLevelCosts({
+                startDate: start.toISOString().split("T")[0],
+                endDate: end.toISOString().split("T")[0],
+                granularity,
+                groupBy
             });
-            // Send email notification here as well if needed
-            const emailParams = {
-                Destination: { ToAddresses: [email] },
-                Message: {
-                    Body: { Text: { Data: `Your AWS Resource-level Cost Report is ready.\n\nYou can download the PDF report here: ${cachedReportUrl}` } },
-                    Subject: { Data: "Your AWS Resource-level Cost Report" },
-                },
-                Source: "cost-reports@learnmorecloud.com"
-            };
-            try {
-                await ses.send(new SendEmailCommand(emailParams));
-            } catch (err) {
-                console.error(`Failed to send email for request ${requestId}:`, err);
-            }
+        } catch (err) {
+            await ddbUtils.updateReportStatus(requestId, {
+                reportUrl: "ERROR",
+                costSummaryText: `Failed to generate report: ${err.message}`
+            });
             continue;
         }
-        // If cache miss, proceed with report generation
+        
+        // Proceed with report generation
         console.log(`Generating report for request ${requestId}`);
 
-        const summaryPrompt = buildCostSummaryPrompt(data, granularity, groupBy);
+        const summaryPrompt = buildCostSummaryPrompt(data, userCommand, granularity);
         const bedrockCostResponse = await askBedrock(summaryPrompt);
         const costSummaryText = bedrockCostResponse.trim();
         const pdfBuffer = await generateCostReportPDF(costSummaryText, data);
@@ -147,8 +103,10 @@ export const handler = async (event) => {
             ContentType: "application/pdf",
         }));
         const finalReportUrl = `${CF_URL}/${pdfKey}`;
-        // Use DDBUtils for atomic cache write
-        await ddbUtils.setCache({ cacheKey, data, reportUrl: finalReportUrl });
+        console.log(`PDF report generated for request ${requestId}: ${finalReportUrl}`);
+
+        // Use DDBUtils for atomic cache write with summary
+        await ddbUtils.setCache({ cacheKey, data, reportUrl: finalReportUrl, costSummaryText });
 
         console.log(`Generated report for request ${requestId}: ${finalReportUrl}`);
         // Send email

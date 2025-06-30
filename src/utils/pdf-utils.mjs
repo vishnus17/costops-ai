@@ -25,7 +25,7 @@ export async function generateCostReportPDF(responseText, data) {
             renderedTitle = true;
         }
         else if (
-            /^(total (spend|monthly spend)|service breakdown|top resources by spend|trends and anomalies)$/i.test(trimmed.replace(":", ""))
+            /^(total (spend|monthly spend)|service breakdown|top resources by spend|trends and anomalies|summary)$/i.test(trimmed.replace(":", ""))
         ) {
             doc.moveDown(1);
             doc.font('Helvetica-Bold').fontSize(16).fillColor('#34495e').text(trimmed.replace(":", ""), { underline: true });
@@ -74,7 +74,8 @@ export async function generateCostReportPDF(responseText, data) {
         .sort((a, b) => b.cost - a.cost);
 
     if (serviceCosts.length > 0) {
-        // Pie chart heading
+        // Pie chart heading on a new page
+        doc.addPage();
         doc.moveDown(1);
         doc.font('Helvetica-Bold').fontSize(16).fillColor('#2c3e50').text('AWS Cost Distribution by Service', { align: 'center', underline: true });
         doc.moveDown(0.5);
@@ -114,14 +115,14 @@ export async function generateCostReportPDF(responseText, data) {
         const legendBoxSize = 14;
         const legendTextOffset = 8;
         const legendFont = 'Helvetica';
-        const legendFontSize = 10;
-        const legendEntrySpacingX = 24; // Space between legend entries horizontally
-        const legendEntrySpacingY = 12; // Space between legend rows vertically
+        const legendFontSize = 8; // Reduced font size for legend
+        const legendEntrySpacingX = 18; // Slightly reduced spacing
+        const legendEntrySpacingY = 8; // Slightly reduced vertical spacing
         const legendMaxWidth = doc.page.width - doc.page.margins.right;
         doc.font(legendFont).fontSize(legendFontSize);
         // Title for legend
-        doc.font('Helvetica-Bold').fontSize(12).fillColor('#222').text('Service Breakdown', legendX, legendY, { continued: false });
-        legendY += 22;
+        doc.font('Helvetica-Bold').fontSize(10).fillColor('#222').text('Service Breakdown', legendX, legendY, { continued: false });
+        legendY += 16;
         let rowHeight = 0;
         serviceCosts.slice(0, 30).forEach((s, i) => {
             const percent = ((s.cost / total) * 100).toFixed(1);

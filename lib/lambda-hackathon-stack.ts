@@ -2,9 +2,15 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import { S3BucketOrigin } from 'aws-cdk-lib/aws-cloudfront-origins';
 
+export interface LambdaHackathonStackProps extends cdk.StackProps {
+  domainName: string;
+}
+
 export class LambdaHackathonStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props: LambdaHackathonStackProps) {
     super(scope, id, props);
+
+    const domainName = props?.domainName;
 
     // SES for email notifications
     const sesIdentity = new cdk.aws_ses.EmailIdentity(this, 'EmailIdentity', {
@@ -38,6 +44,14 @@ export class LambdaHackathonStack extends cdk.Stack {
       autoDeleteObjects: true,
     });
 
+    // Cert SSM store
+    const certArn = cdk.aws_ssm.StringParameter.valueForStringParameter(this, '/ue1/certificateArn');
+
+    // ACM cert
+    const certificate = cdk.aws_certificatemanager.Certificate.fromCertificateArn(
+      this, 'Certificate', certArn
+    );
+
     // CloudFront distribution
     const distribution = new cdk.aws_cloudfront.Distribution(this, 'ReportsDistribution', {
       defaultBehavior: {
@@ -47,6 +61,8 @@ export class LambdaHackathonStack extends cdk.Stack {
         cachedMethods: cdk.aws_cloudfront.CachedMethods.CACHE_GET_HEAD,
         cachePolicy: cdk.aws_cloudfront.CachePolicy.CACHING_OPTIMIZED_FOR_UNCOMPRESSED_OBJECTS
       },
+      domainNames: [domainName],
+      certificate: certificate,
       defaultRootObject: 'index.html',
     });
 
@@ -71,7 +87,8 @@ export class LambdaHackathonStack extends cdk.Stack {
         "ce:GetSavingsPlansCoverage",
         "ce:GetTags",
         "ce:GetUsageForecast",
-        "ce:GetCostAndUsageWithResources"
+        "ce:GetCostAndUsageWithResources",
+        "ce:GetCostAndUsageComparisons"
       ],
       resources: ["*"],
     });
@@ -112,7 +129,7 @@ export class LambdaHackathonStack extends cdk.Stack {
       memorySize: 1024,
       environment: {
         REPORTS_BUCKET: reportsBucket.bucketName,
-        CF_URL: distribution.distributionDomainName,
+        CF_URL: domainName,
         REPORTS_DDB_TABLE: costReportTable.tableName,
         COST_EXPLORER_CACHE_TABLE: costExplorerCacheTable.tableName,
       },
@@ -130,7 +147,8 @@ export class LambdaHackathonStack extends cdk.Stack {
       timeout: cdk.Duration.seconds(60),
       memorySize: 1024,
       environment: {
-        CF_URL: distribution.distributionDomainName,
+        CF_URL: domainName,
+        REPORTS_BUCKET: reportsBucket.bucketName,
         REPORTS_DDB_TABLE: costReportTable.tableName,
         COST_EXPLORER_CACHE_TABLE: costExplorerCacheTable.tableName,
         SCHEDULED_COST_REPORT_LAMBDA_ARN: scheduledCostReportLambda.functionArn,
@@ -150,7 +168,7 @@ export class LambdaHackathonStack extends cdk.Stack {
       memorySize: 1024,
       environment: {
         REPORTS_BUCKET: reportsBucket.bucketName,
-        CF_URL: distribution.distributionDomainName,
+        CF_URL: domainName,
         REPORTS_DDB_TABLE: costReportTable.tableName,
         COST_EXPLORER_CACHE_TABLE: costExplorerCacheTable.tableName,
         SES_IDENTITY: sesIdentity.emailIdentityName,
@@ -167,6 +185,60 @@ export class LambdaHackathonStack extends cdk.Stack {
       retryAttempts: 2,
     }));
 
+    // Pre-signup Lambda for Cognito User Pool
+    const preSignUpLambda = new cdk.aws_lambda.Function(this, 'PreSignUpLambda', {
+      functionName: 'PreSignUpLambda',
+      description: 'Lambda function for Cognito User Pool pre-signup trigger',
+      runtime: cdk.aws_lambda.Runtime.NODEJS_22_X,
+      handler: 'pre-signup.handler',
+      code: cdk.aws_lambda.Code.fromAsset('src/lambdas'),
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 128,
+    });
+
+    // User Pool and Cognito Authorizer for API Gateway
+    const userPool = new cdk.aws_cognito.UserPool(this, 'UserPool', {
+      userPoolName: 'CostOpsUserPool',
+      selfSignUpEnabled: true,
+      signInAliases: { email: true },
+      lambdaTriggers: {
+        preSignUp: preSignUpLambda,
+      },
+    });
+
+    // Cognito User Pool Domain
+    new cdk.aws_cognito.UserPoolDomain(this, 'UserPoolDomain', {
+      userPool,
+      cognitoDomain: {
+        domainPrefix: 'costops',
+      },
+    });
+
+    new cdk.aws_cognito.UserPoolClient(this, 'UserPoolClient', {
+      userPoolClientName: 'CostOpsUserPoolClient',
+      userPool,
+      oAuth: {
+        flows: {
+          authorizationCodeGrant: true,
+          implicitCodeGrant: true,
+        },
+        callbackUrls: ['http://localhost:3000', 'https://costops.learnmorecloud.com'],
+        defaultRedirectUri: 'https://costops.learnmorecloud.com',
+        logoutUrls: ['https://costops.learnmorecloud.com'],
+        scopes: [cdk.aws_cognito.OAuthScope.OPENID, cdk.aws_cognito.OAuthScope.EMAIL],
+      },
+      supportedIdentityProviders: [cdk.aws_cognito.UserPoolClientIdentityProvider.COGNITO],
+      authFlows: {
+        userPassword: true,
+        custom: true,
+        userSrp: true,
+      },
+    });
+
+    const authorizer = new cdk.aws_apigateway.CognitoUserPoolsAuthorizer(this, 'APIAuthorizer', {
+      cognitoUserPools: [userPool],
+    });
+
     // === API Gateway ===
     const api = new cdk.aws_apigateway.RestApi(this, 'chatopsApi', {
       restApiName: 'api-devops-chatops',
@@ -178,7 +250,11 @@ export class LambdaHackathonStack extends cdk.Stack {
       },
     });
     const chatResource = api.root.addResource('chat');
-    chatResource.addMethod('POST', new cdk.aws_apigateway.LambdaIntegration(lambdaFunction));
+
+    chatResource.addMethod('POST', new cdk.aws_apigateway.LambdaIntegration(lambdaFunction), {
+      authorizer,
+      authorizationType: cdk.aws_apigateway.AuthorizationType.COGNITO,
+    });
 
     // === Outputs ===
     new cdk.CfnOutput(this, 'CFDistributionDomainName', {

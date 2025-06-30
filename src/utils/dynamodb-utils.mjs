@@ -20,6 +20,7 @@ export class DDBUtils {
                     return {
                         data: JSON.parse(cacheResp.Item.data.S),
                         reportUrl: cacheResp.Item.reportUrl?.S || null,
+                        summary: cacheResp.Item.summary?.S || null,
                         hit: true
                     };
                 }
@@ -30,63 +31,89 @@ export class DDBUtils {
         return { hit: false };
     }
 
-    async setCache({ cacheKey, data, reportUrl, ttlSeconds = 12 * 60 * 60 }) {
-        const now = Date.now();
-        const ttl = Math.floor(now / 1000) + ttlSeconds;
-        await this.dynamo.send(new PutItemCommand({
-            TableName: this.cacheTable,
-            Item: {
-                cacheKey: { S: cacheKey },
-                data: { S: JSON.stringify(data) },
-                reportUrl: { S: reportUrl },
-                timestamp: { N: now.toString() },
-                ttl: { N: ttl.toString() }
-            }
-        }));
+    async setCache({ cacheKey, data, reportUrl, ttlSeconds = 12 * 60 * 60, costSummaryText }) {
+        try {
+            const now = Date.now();
+            const ttl = Math.floor(now / 1000) + ttlSeconds;
+            await this.dynamo.send(new PutItemCommand({
+                TableName: this.cacheTable,
+                Item: {
+                    cacheKey: { S: cacheKey },
+                    data: { S: JSON.stringify(data) },
+                    reportUrl: { S: reportUrl },
+                    timestamp: { N: now.toString() },
+                    ttl: { N: ttl.toString() },
+                    summary: { S: costSummaryText }
+                }
+            }));
+        } catch (err) {
+            console.error(`[DDBUtils] Error setting cache for key ${cacheKey}: ${err.message}`);
+            throw err;
+        }
     }
 
     // --- Report table logic ---
     async saveReport({ requestId, userCommand, parsedJsonQuery, reportUrl, costSummaryText, email }) {
-        await this.dynamo.send(new PutItemCommand({
-            TableName: this.reportsTable,
-            Item: {
-                requestId: { S: requestId },
-                userCommand: { S: userCommand },
-                parsedJsonQuery: { S: JSON.stringify(parsedJsonQuery) },
-                reportUrl: { S: reportUrl },
-                costSummaryText: { S: costSummaryText },
-                createdAt: { S: new Date().toISOString() },
-                ...(email ? { email: { S: email } } : {})
-            }
-        }));
+        try {
+            await this.dynamo.send(new PutItemCommand({
+                TableName: this.reportsTable,
+                Item: {
+                    requestId: { S: requestId },
+                    userCommand: { S: userCommand },
+                    parsedJsonQuery: { S: JSON.stringify(parsedJsonQuery) },
+                    reportUrl: { S: reportUrl },
+                    summary: { S: costSummaryText },
+                    createdAt: { S: new Date().toISOString() },
+                    ...(email ? { email: { S: email } } : {})
+                }
+            }));
+        } catch (err) {
+            console.error(`[DDBUtils] Error saving report for requestId ${requestId}: ${err.message}`);
+            throw err;
+        }
     }
 
     async getReport(requestId) {
-        const res = await this.dynamo.send(new GetItemCommand({
-            TableName: this.reportsTable,
-            Key: { requestId: { S: requestId } }
-        }));
-        return res.Item;
+        try {
+            const res = await this.dynamo.send(new GetItemCommand({
+                TableName: this.reportsTable,
+                Key: { requestId: { S: requestId } }
+            }));
+            return res.Item;
+        } catch (err) {
+            console.error(`[DDBUtils] Error getting report for requestId ${requestId}: ${err.message}`);
+            throw err;
+        }
     }
 
     async updateEmail(requestId, email) {
-        await this.dynamo.send(new UpdateItemCommand({
-            TableName: this.reportsTable,
-            Key: { requestId: { S: requestId } },
-            UpdateExpression: "SET email = :e",
-            ExpressionAttributeValues: { ":e": { S: email } }
-        }));
+        try {
+            await this.dynamo.send(new UpdateItemCommand({
+                TableName: this.reportsTable,
+                Key: { requestId: { S: requestId } },
+                UpdateExpression: "SET email = :e",
+                ExpressionAttributeValues: { ":e": { S: email } }
+            }));
+        } catch (err) {
+            console.error(`[DDBUtils] Error updating email for requestId ${requestId}: ${err.message}`);
+            throw err;
+        }
     }
 
     async updateReportStatus(requestId, { reportUrl, costSummaryText }) {
-        await this.dynamo.send(new UpdateItemCommand({
-            TableName: this.reportsTable,
-            Key: { requestId: { S: requestId } },
-            UpdateExpression: "SET reportUrl = :u, costSummaryText = :t",
-            ExpressionAttributeValues: {
-                ":u": { S: reportUrl },
-                ":t": { S: costSummaryText }
-            }
-        }));
+        try {
+            await this.dynamo.send(new UpdateItemCommand({
+                TableName: this.reportsTable,
+                Key: { requestId: { S: requestId } },
+                UpdateExpression: "SET reportUrl = :u, costSummaryText = :t",
+                ExpressionAttributeValues: {
+                    ":u": { S: reportUrl },
+                    ":t": { S: costSummaryText }
+                }
+            }));
+        } catch (err) {
+            console.error(`[DDBUtils] Error updating report status for requestId ${requestId}: ${err.message}`);
+            throw err;
+        }
     }
 }
