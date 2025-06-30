@@ -1,7 +1,7 @@
 # Lambda Hackathon: Serverless AWS Cost & Incident Reporting
 
 ## Overview
-This project is a modern, serverless AWS solution for automated cost and incident reporting, leveraging Lambda, DynamoDB, S3, CloudFront, SES, EventBridge, API Gateway, and Bedrock AI. It is designed for DevOps, FinOps, and CloudOps teams who want actionable, AI-powered cost insights and incident summaries delivered via API or scheduled email.
+This project is a modern, serverless AWS solution for automated cost and incident reporting, leveraging Cost Explorer, Lambda, Cognito, DynamoDB, S3, CloudFront, SES, EventBridge, API Gateway, and Bedrock AI. It is designed for DevOps, FinOps, and CloudOps teams who want actionable, AI-powered cost insights and incident summaries delivered via API or scheduled email.
 
 ### Architecture Diagram
 
